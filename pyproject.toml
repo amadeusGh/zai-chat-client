@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zai-chat-client"
+version = "0.1.0"
+description = "Async Playwright client library for chat.z.ai automation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "zai-chat-client contributors" }
+]
+keywords = ["playwright", "automation", "chat", "zai"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "playwright>=1.40.0",
+]
+
+[project.optional-dependencies]
+camoufox = [
+  "camoufox",
+  "browserforge",
+]
+
+[tool.setuptools.packages.find]
+include = ["zai_chat_client*"]
+
+[tool.setuptools.package-data]
+zai_chat_client = ["py.typed"]
