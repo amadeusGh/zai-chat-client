@@ -1,58 +1,52 @@
 # zai-chat-client
 
-`zai-chat-client` is a Python async library for working with the web version of [https://chat.z.ai](https://chat.z.ai) through a real browser session.
+`zai-chat-client` is an unofficial async Python client for working with the web version of [https://chat.z.ai](https://chat.z.ai).
 
-It allows you to log in using a saved session, a Netscape-format cookie file, or manual login, then create and open chats, choose a model, toggle Deep Think and Web Search, send prompts, wait until the response is fully generated, and regenerate answers when needed.
-
-If you want to use chat.z.ai as a programmable tool — for scripts, lightweight automation, content generation, experiments, or simply to access its free models for small tasks — this library gives you a clean and repeatable way to do it.
+It drives a real browser via Playwright and lets you use chat.z.ai as a programmable tool: you can log in, create/open/delete chats, select a model, toggle options like Deep Think and Web Search, send prompts, wait until the answer is fully generated, and regenerate responses when needed. It’s especially handy when you want a free model for lightweight tasks, small automations, experiments, or scripts.
 
 ---
 
-## What It Does
+## What this library can do
 
-The client starts a Playwright browser session and verifies authorization state. It can restore a previously saved session file or bootstrap login from cookies. Manual login is supported when automatic methods are not sufficient.
+It starts a browser session, ensures you’re authorized, and then gives you a clean async API to control chat.z.ai like a normal user would. In practice you’ll use it to bootstrap login (session, cookies.txt, or manual login), manage chats (create/open/delete), choose models, flip Deep Think/Web Search on or off, send messages with reliable “wait until done” behavior, and regenerate the last assistant message.
 
-Once authorized, you can create new chats or open existing ones by id or URL. The client supports selecting a model during chat creation and toggling Deep Think or Web Search either globally or per message.
+---
 
-Message sending is wrapped in a controlled flow that waits until generation is complete before returning the result. Each assistant response is represented as a structured object that includes the prompt text, response text, character count, generation timing, DOM identifier, regeneration count, and error state.
+## Requirements
 
-You can also regenerate the last assistant response and delete chats programmatically. Optional logs and configurable action delays are available for better visibility and pacing control.
+You’ll need Python 3.11+ and Playwright browser binaries installed.
 
 ---
 
 ## Installation
 
-Requirements:
+First, install the package and then install Playwright browsers.
 
-Python 3.11 or newer
-Playwright browser binaries installed
-
-Recommended installation with Camoufox:
-
-```bash
-python -m pip install -e .[camoufox]
-python -m playwright install
-```
-
-Minimal installation without Camoufox:
+Minimal install (pure Playwright):
 
 ```bash
 python -m pip install -e .
 python -m playwright install
 ```
 
+Recommended install (with Camoufox):
+
+```bash
+python -m pip install -e .[camoufox]
+python -m playwright install
+```
+
 ---
 
-## Camoufox
+## Camoufox (anti-bot friendly mode)
 
-This library uses Camoufox by default:
-[https://github.com/daijro/camoufox](https://github.com/daijro/camoufox)
+By default, this library uses Camoufox: [https://github.com/daijro/camoufox](https://github.com/daijro/camoufox)
 
-Camoufox modifies browser fingerprints and reduces common automation signals. In practice, this helps automated sessions behave closer to normal user activity and can improve stability on sites with stricter bot-detection heuristics.
-
-If you prefer pure Playwright behavior, you can disable it:
+Camoufox tweaks browser fingerprints and reduces common automation signals. In practice, this helps when a website behaves differently under default Playwright automation or applies anti-bot checks. If you prefer pure Playwright behavior, disable it like this:
 
 ```python
+from zai_chat_client import ZaiClient
+
 client = ZaiClient(
     session="main",
     use_camoufox=False,
@@ -62,6 +56,8 @@ client = ZaiClient(
 ---
 
 ## Quick Start
+
+This example creates a new chat, sends a message, waits for the full response, prints it, and closes the browser.
 
 ```python
 import asyncio
@@ -86,11 +82,8 @@ async def main() -> None:
             web_search=False,
         )
 
-        message = await chat.send_message(
-            "Hello! Reply in one short sentence."
-        )
-
-        print(message.response_text)
+        msg = await chat.send_message("Hello! Reply in one short sentence.")
+        print(msg.response_text)
 
     finally:
         await client.close()
@@ -99,71 +92,286 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
----
-
-## Authentication
-
-Authentication is resolved in priority order.
-
-If a session file is configured and valid, it is used immediately. A session file stores the browser storage state from a previous successful login and is the recommended production setup.
-
-If no valid session is available, the client can load cookies from a Netscape HTTP Cookie File provided through `cookies_path`. If authorization succeeds, the session state is saved internally. After that, cookies are no longer required for subsequent runs.
-
-If both methods fail and `allow_manual_login=True` is enabled, the browser opens in non-headless mode and you can log in manually. After successful login confirmation, the session is saved and reused in future runs. Manual login requires `headless=False`; otherwise a `ManualLoginError` is raised.
+If this is your first run and you already have cookies exported, `cookies_path="cookies.txt"` is usually enough. After a successful start, the library will keep using the saved session and you won’t need cookies again.
 
 ---
 
-## Exporting Cookies (Netscape Format)
+## Authentication (how it works)
 
-The client expects cookies in the classic Netscape HTTP Cookie File format.
+The library resolves authorization in this order.
 
-To export cookies from your browser:
+First it tries a saved session (the `session` argument). A session is a stored browser state from a previous successful login. When it’s valid, startup is fast and fully automatic.
 
-1. Install a browser extension such as:
+If no valid session is available, it tries cookies from `cookies_path`. The cookie file must be in Netscape format (classic `cookies.txt`). If the cookies authorize successfully, the library saves a session internally, so on the next runs cookies are not needed anymore.
 
-   * “Get cookies.txt LOCALLY” for Chrome
-   * A “cookies.txt” export extension for Firefox
+If both session and cookies fail, you can enable manual login with `allow_manual_login=True`. This requires `headless=False`. The browser window opens, you log in normally, then confirm in the terminal, and the session is saved for future runs.
 
-2. Log in to [https://chat.z.ai](https://chat.z.ai) in your regular browser.
+Important practical note: cookies are usually only needed once (first successful run). After that, the session file is enough.
 
-3. Use the extension to export cookies for the `chat.z.ai` domain.
+---
 
-4. Save the file as `cookies.txt` and pass its path to the client:
+## Exporting cookies.txt (Netscape format)
+
+If you want to bootstrap login from your own browser cookies, do this:
+
+Open chat.z.ai in your normal browser and log in.
+
+Install a cookies exporter extension that can output Netscape cookies.txt format. Common options are “Get cookies.txt LOCALLY” for Chrome, or a “cookies.txt” exporter extension for Firefox.
+
+Export cookies for the `chat.z.ai` domain and save them as `cookies.txt`.
+
+Then pass that file to the client:
+
+```python
+from zai_chat_client import ZaiClient
+
+client = ZaiClient(
+    session="main",
+    cookies_path="cookies.txt",
+    headless=True,
+)
+```
+
+If the file is not in Netscape format, the library will raise `CookieFormatError`. If the format is fine but cookies are expired/invalid, authorization will fail and you’ll need fresh cookies or manual login.
+
+---
+
+## Common usage examples
+
+### 1) Session-only startup (typical daily use)
+
+After you have a working session saved, you can start without cookies:
+
+```python
+client = ZaiClient(
+    session="main",
+    headless=True,
+)
+await client.start()
+```
+
+---
+
+### 2) Bootstrap from cookies (first run)
 
 ```python
 client = ZaiClient(
     session="main",
     cookies_path="cookies.txt",
+    headless=True,
+)
+await client.start()
+```
+
+---
+
+### 3) Manual login fallback
+
+Use this when cookies aren’t available or don’t work.
+
+```python
+client = ZaiClient(
+    session="main_manual",
+    allow_manual_login=True,
+    headless=False,
+)
+await client.start()
+```
+
+---
+
+### 4) Create a chat and pick model/options
+
+```python
+chat = await client.create_chat(
+    model="GLM-5",
+    mode="chat",
+    deep_think=False,
+    web_search=False,
 )
 ```
 
-The file must contain cookies for the correct domain and follow the Netscape format. If the format is invalid, `CookieFormatError` will be raised.
+---
 
-After successful startup, the client saves the session internally, so cookies do not need to be reused again.
+### 5) Open an existing chat by id or URL
+
+```python
+chat = await client.open_chat("c6400a96-8aa9-4e1b-817c-5ba9419cbfbd")
+# or:
+chat = await client.open_chat("https://chat.z.ai/c/c6400a96-8aa9-4e1b-817c-5ba9419cbfbd")
+```
+
+---
+
+### 6) Send a message and override options per call
+
+```python
+msg = await chat.send_message(
+    "Summarize this in 3 bullet points.",
+    web_search=True,
+    deep_think=False,
+)
+
+print(msg.ok, msg.response_chars)
+print(msg.response_text)
+```
+
+---
+
+### 7) Regenerate the last assistant response
+
+```python
+msg2 = await chat.regenerate_last_response()
+print(msg2.response_text)
+```
+
+You can also regenerate directly from the message object:
+
+```python
+msg2 = await msg.regenerate()
+```
+
+---
+
+### 8) Delete a chat
+
+Delete by chat object:
+
+```python
+ok = await chat.delete()
+print(ok)
+```
+
+Or delete by id/URL using the client:
+
+```python
+ok = await client.delete_chat("c6400a96-8aa9-4e1b-817c-5ba9419cbfbd")
+print(ok)
+```
 
 ---
 
 ## API Overview
 
-The `ZaiClient` constructor allows configuration of browser behavior, window size, session storage target, cookie path, login fallback, logging, timeout, navigation retry count, and optional humanized action delays.
+### `ZaiClient`
 
-The `start()` method initializes the browser and verifies authorization. The `close()` method gracefully shuts down browser resources. Additional methods allow navigation, session saving, chat creation, chat opening, message sending, regeneration of the last response, and chat deletion.
+`ZaiClient` is the main entry point of the library.
+It manages the browser instance, authentication, navigation, and chat-level operations.
 
-`ChatSession` represents an active chat context. It exposes methods to ensure the chat is open, toggle Deep Think and Web Search, send messages, and delete the chat. It also tracks internal timing information for action sequencing.
+You usually create one client, start it once, perform your automation tasks, and then close it.
 
-`ChatMessage` represents a single assistant generation result. It contains the original prompt text, assistant response text, response character count, timestamps for generation start and finish, total generation duration in seconds, DOM identifiers, regeneration count, and error state. The `ok` property indicates whether the generation completed successfully. The `regenerate()` method triggers response regeneration.
+---
+
+### Constructor
+
+```python
+client = ZaiClient(...)
+```
+
+| Argument                           | Type                | Description                                                                                                          |
+| ---------------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `base_url`                         | `str`               | Base URL of the chat service. Default: `https://chat.z.ai`. Normally you don't need to change it.                  |
+| `headless`                         | `bool`              | Whether the browser runs without a visible window. Set `False` if you want to see the browser or use manual login. |
+| `use_camoufox`                     | `bool`              | Enables Camoufox browser fingerprint modifications to reduce automation detection. Enabled by default.              |
+| `window_width`                     | `int \| None`       | Optional browser window width. Useful when running non-headless sessions.                                           |
+| `window_height`                    | `int \| None`       | Optional browser window height.                                                                                      |
+| `session`                          | `str \| Path \| None` | Name or path for the stored browser session. If valid, the client restores login automatically.                   |
+| `cookies_path`                     | `str \| Path \| None` | Path to a Netscape-format `cookies.txt` file used to bootstrap login. Usually needed only for the first run.     |
+| `allow_manual_login`               | `bool`              | Enables manual login fallback if session and cookies fail. Requires `headless=False`.                               |
+| `enable_logs`                      | `bool`              | Enables colored terminal logs for debugging and visibility of automation steps.                                     |
+| `timeout_ms`                       | `int`               | Default timeout for Playwright operations in milliseconds.                                                          |
+| `navigation_retries`               | `int`               | Number of retries when page navigation fails.                                                                       |
+| `keep_browser_open_on_start_error` | `bool`              | Keeps the browser open if startup fails, useful for debugging login problems.                                       |
+| `humanize_actions`                 | `bool`              | Enables small delays between actions to mimic human behavior.                                                       |
+| `min_action_delay_s`               | `float`             | Minimum delay between automated actions when humanization is enabled.                                               |
+| `max_action_delay_s`               | `float`             | Maximum delay between automated actions.                                                                            |
+
+---
+
+### `ZaiClient` methods
+
+| Method                             | Arguments (types)                                                                 | Returns         | Description                                                                                    |
+| ---------------------------------- | --------------------------------------------------------------------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
+| `await start()`                    | `—`                                                                               | `ZaiClient`     | Starts the browser, restores authentication state, and verifies that the account is logged in. |
+| `await close()`                    | `—`                                                                               | `None`          | Gracefully closes the browser and releases Playwright resources.                               |
+| `await open(url)`                  | `url: str`                                                                        | `None`          | Navigates the browser to a specific URL using retry logic.                                     |
+| `await save_session()`             | `—`                                                                               | `None`          | Saves the current browser storage state to the configured session file.                        |
+| `await create_chat(...)`           | `model: str \| None`, `mode: str`, `deep_think: bool \| None`, `web_search: bool \| None` | `ChatSession` | Creates a new chat and returns a `ChatSession` object.                                         |
+| `await open_chat(chat_ref)`        | `chat_ref: str`                                                                   | `ChatSession`   | Opens an existing chat using a chat id or full URL.                                            |
+| `await send_message(...)`          | `text: str`, `deep_think: bool \| None`, `web_search: bool \| None`             | `ChatMessage`   | Sends a message in the currently opened chat page and returns a `ChatMessage`.                 |
+| `await regenerate_last_response()` | `—`                                                                               | `ChatMessage`   | Regenerates the latest assistant response in the current chat.                                 |
+| `await delete_chat(chat_ref)`      | `chat_ref: str \| ChatSession \| None = None`                                    | `bool`          | Deletes a chat by id, URL, `ChatSession`, or current chat context.                             |
+
+---
+
+### `ChatSession`
+
+`ChatSession` represents one specific chat in chat.z.ai.
+
+Most real interactions with the assistant happen through this object.
+
+---
+
+### `ChatSession` methods
+
+| Method                          | Arguments (types)                                             | Returns       | Description                                                                                                      |
+| ------------------------------- | ------------------------------------------------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `await ensure_open()`           | `—`                                                           | `None`        | Ensures the chat is currently opened in the browser.                                                             |
+| `await set_deep_think(enabled)` | `enabled: bool`                                               | `bool`        | Enables or disables the Deep Think mode.                                                                         |
+| `await get_deep_think()`        | `—`                                                           | `bool`        | Returns the current Deep Think state.                                                                            |
+| `await set_web_search(enabled)` | `enabled: bool`                                               | `bool`        | Enables or disables Web Search mode.                                                                             |
+| `await get_web_search()`        | `—`                                                           | `bool`        | Returns the current Web Search state.                                                                            |
+| `await send_message(text, ...)` | `text: str`, `deep_think: bool \| None`, `web_search: bool \| None` | `ChatMessage` | Sends a message in the chat and waits until the assistant finishes generating a response.                       |
+| `await delete()`                | `—`                                                           | `bool`        | Deletes this chat from the chat list.                                                                            |
+
+`ChatSession` also tracks internal action timing fields such as `last_action_at` and `last_action_name`, which are useful for debugging or automation pacing.
+
+---
+
+### `ChatMessage`
+
+`ChatMessage` represents the result of a single assistant generation.
+
+It contains both the generated text and metadata describing how the generation happened.
+
+---
+
+### `ChatMessage` fields
+
+| Field                      | Type                | Description                                                              |
+| -------------------------- | ------------------- | ------------------------------------------------------------------------ |
+| `prompt_text`              | `str`               | The text prompt that was sent to the assistant.                          |
+| `response_text`            | `str`               | The assistant's generated response text.                                 |
+| `response_chars`           | `int`               | Length of the generated response in characters.                          |
+| `generation_started_at`    | `datetime \| None`  | Timestamp when generation started.                                       |
+| `generation_finished_at`   | `datetime \| None`  | Timestamp when generation finished.                                      |
+| `generation_seconds`       | `float \| None`     | Total generation duration in seconds.                                    |
+| `assistant_message_dom_id` | `str \| None`       | Internal DOM identifier of the assistant message.                        |
+| `refreshed_count`          | `int`               | Number of auto-refresh recovery attempts during stalled generation.      |
+| `error`                    | `str \| None`       | Error message if generation failed.                                      |
+| `ok`                       | `bool`              | Boolean indicating whether the message was generated successfully.       |
+
+---
+
+### `ChatMessage` methods
+
+| Method               | Arguments (types) | Returns       | Description                                                                             |
+| -------------------- | ----------------- | ------------- | --------------------------------------------------------------------------------------- |
+| `await regenerate()` | `—`               | `ChatMessage` | Regenerates the assistant response for the same prompt and returns a new `ChatMessage`. |
 
 ---
 
 ## Known Constraints
 
-The library depends on website selectors and may require updates if the chat.z.ai UI changes. Currently only `mode="chat"` is supported in chat creation. File upload flows are not implemented.
+This is UI automation, so it depends on website selectors and can require updates when chat.z.ai changes its UI. At the moment, only `mode="chat"` is supported in `create_chat`. File upload flows are not implemented yet.
 
 ---
 
-## Roadmap
+## What’s being improved
 
-Planned improvements include stronger resilience against UI changes, expanded usage examples for production workflows, broader automated testing for session and navigation layers, and additional authentication features such as login using email and password, as well as automated account registration.
+Stability against future UI layout changes is always being improved. More production-ready usage recipes and stronger automated tests for session/navigation layers are planned.
+
+Authentication features are also on the roadmap, including login using email and password, and automated account registration.
 
 ---
 

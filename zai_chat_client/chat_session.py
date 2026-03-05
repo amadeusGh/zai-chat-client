@@ -16,8 +16,10 @@ def _chat_action(*, pace: bool = False) -> Callable[[F], F]:
     """Wrap a chat action to apply pacing and action timestamp updates."""
 
     def decorator(func: F) -> F:
+        """Decorate an async ChatSession method with pre/post action hooks."""
         @wraps(func)
         async def wrapper(self: "ChatSession", *args, **kwargs):
+            """Execute the action while recording pacing/last-action metadata."""
             await self.client._before_chat_action(self, action_name=func.__name__, pace=pace)
             try:
                 return await func(self, *args, **kwargs)

@@ -44,10 +44,12 @@ class ZaiClient:
     _DEFAULT_WINDOW_HEIGHT = 1080
     _GEN_POLL_SECONDS = 0.6
     _GEN_STALL_SECONDS = 22.0
-    _GEN_TOTAL_TIMEOUT_SECONDS = 420.0
+    _GEN_TOTAL_TIMEOUT_SECONDS = 1800.0
     _GEN_MAX_REFRESHES = 2
     _GEN_HEARTBEAT_SECONDS = 10.0
     _GEN_WEB_SEARCH_STALE_SECONDS = 35.0
+    _GEN_DONE_STABLE_SECONDS = 3.0
+    _GEN_DONE_STABLE_REASONING_SECONDS = 8.0
 
     def __init__(
         self,
@@ -67,6 +69,7 @@ class ZaiClient:
         min_action_delay_s: float = 0.4,
         max_action_delay_s: float = 1.2,
     ) -> None:
+        """Initialize client configuration and runtime placeholders."""
         normalized_base_url = base_url.strip()
         if not normalized_base_url:
             raise ValueError("base_url must not be empty.")
@@ -129,6 +132,7 @@ class ZaiClient:
 
     @property
     def authorized(self) -> bool:
+        """Return the last known authorization state."""
         return self._authorized
 
     async def start(self) -> "ZaiClient":
@@ -232,10 +236,12 @@ class ZaiClient:
             self._closing = False
 
     async def __aenter__(self) -> "ZaiClient":
+        """Enter async context by starting the browser client."""
         await self.start()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Exit async context by closing browser resources."""
         await self.close()
 
     async def open(self, url: str) -> None:
@@ -317,6 +323,7 @@ class ZaiClient:
         return False
 
     async def _wait_authorization_resolved(self, timeout_ms: int = 8_000) -> bool:
+        """Wait until auth UI resolves to either profile-visible or sign-in-visible."""
         deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
         while True:
             profile = self.page.locator(S.USER_PROFILE_IMAGE).first
@@ -331,13 +338,49 @@ class ZaiClient:
                 return await self.is_authorized()
             await asyncio.sleep(0.2)
 
-    async def _dismiss_startup_popup(self) -> None:
-        for _ in range(3):
-            later_button = self.page.get_by_role("button", name=re.compile(r"^Later$", re.I)).first
+    async def _dismiss_startup_popup(
+        self,
+        chat: ChatSession | None = None,
+        allow_chat_restore: bool = True,
+    ) -> bool:
+        """Dismiss known blocking dialogs and return whether a model switch happened."""
+        switched_model = False
+        for _ in range(8):
+            action_taken = False
+            popup = self.page.locator("div[role='dialog']").filter(
+                has_text=re.compile(r"(GLM-?5\s+Now\s+Available|Now\s+Available)", re.I)
+            ).first
+            if await popup.count() > 0 and await popup.is_visible():
+                popup_later = popup.get_by_role(
+                    "button", name=re.compile(r"^(Later|Not now|Maybe later)$", re.I)
+                ).first
+                if await popup_later.count() > 0 and await popup_later.is_visible():
+                    await popup_later.click()
+                    self._log.info("Dismissed startup popup via dialog action button")
+                    await self._short_pause(220)
+                    action_taken = True
+                    continue
+
+                popup_close = popup.locator(
+                    "button[aria-label='Close'], "
+                    "button[aria-label*='close' i], "
+                    "button:has(svg path[d='M6 18 18 6M6 6l12 12'])"
+                ).first
+                if await popup_close.count() > 0 and await popup_close.is_visible():
+                    await popup_close.click()
+                    self._log.info("Dismissed startup popup via dialog close button")
+                    await self._short_pause(220)
+                    action_taken = True
+                    continue
+
+            later_button = self.page.get_by_role(
+                "button", name=re.compile(r"^(Later|Not now|Maybe later)$", re.I)
+            ).first
             if await later_button.count() > 0 and await later_button.is_visible():
                 await later_button.click()
-                self._log.info("Dismissed startup popup via 'Later'")
+                self._log.info("Dismissed startup popup via fallback action button")
                 await self._short_pause(220)
+                action_taken = True
                 continue
 
             # Fallback: close by top-right X button on popup container.
@@ -346,26 +389,159 @@ class ZaiClient:
             ).first
             if await close_button.count() > 0 and await close_button.is_visible():
                 await close_button.click()
-                self._log.info("Dismissed startup popup via close button")
+                self._log.info("Dismissed startup popup via fallback close button")
                 await self._short_pause(220)
+                action_taken = True
                 continue
+            switched_now = await self._handle_peak_hours_popup(
+                chat=chat,
+                allow_chat_restore=allow_chat_restore,
+            )
+            if switched_now:
+                switched_model = True
+                action_taken = True
+            if not action_taken:
+                return switched_model
+        return switched_model
+
+    async def _handle_peak_hours_popup(
+        self,
+        chat: ChatSession | None = None,
+        allow_chat_restore: bool = True,
+    ) -> bool:
+        """Handle the peak-hours modal by clicking `Switch to ...` and restoring chat."""
+        restore_chat = chat
+        if restore_chat is None:
+            current_id = extract_chat_id(self.page.url)
+            if current_id:
+                restore_chat = ChatSession(
+                    client=self,
+                    url=self.page.url,
+                    chat_id=current_id,
+                )
+
+        switch_button = await self._find_visible_peak_hours_switch_button()
+        if switch_button is None:
+            return False
+
+        try:
+            label = (await switch_button.inner_text() or "").strip()
+        except Exception:
+            label = ""
+        self._log.warn(
+            "Peak-hours popup detected. "
+            f"Applying suggested model switch: {label or 'Switch to ...'}"
+        )
+
+        try:
+            await self._wait_clickable(
+                switch_button,
+                "Peak-hours switch button",
+                timeout_ms=4_000,
+            )
+            await switch_button.click()
+            await self._short_pause(250)
+        except Exception as exc:
+            self._log.warn(f"Could not click peak-hours switch button: {exc}")
+            return False
+
+        # Observe for a short window in case dialog reappears after reload.
+        deadline = asyncio.get_running_loop().time() + 8.0
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.5)
+            repeated = await self._find_visible_peak_hours_switch_button()
+            if repeated is None:
+                continue
+            self._log.warn("Peak-hours popup appeared again. Retrying switch")
+            try:
+                await self._wait_clickable(
+                    repeated,
+                    "Peak-hours switch button",
+                    timeout_ms=3_000,
+                )
+                await repeated.click()
+                await self._short_pause(250)
+            except Exception as exc:
+                self._log.warn(f"Retry click for peak-hours popup failed: {exc}")
+
+        if allow_chat_restore and restore_chat is not None:
+            await self._restore_chat_after_peak_hours_switch(restore_chat)
+
+        return True
+
+    async def _find_visible_peak_hours_switch_button(self) -> Locator | None:
+        """Return the first visible `Switch to ...` button from the active UI."""
+        # Preferred: switch button inside an active dialog.
+        dialog_candidates = self.page.locator(
+            "div[role='dialog'] button"
+        ).filter(has_text=re.compile(r"^\s*Switch\s+to\b", re.I))
+        visible_dialog_switch = await self._first_visible(dialog_candidates)
+        if visible_dialog_switch is not None:
+            return visible_dialog_switch
+
+        # Fallback: role-based query in case dialog markup changes.
+        role_candidates = self.page.get_by_role(
+            "button", name=re.compile(r"^\s*Switch\s+to\b", re.I)
+        )
+        return await self._first_visible(role_candidates)
+
+    async def _restore_chat_after_peak_hours_switch(self, chat: ChatSession) -> None:
+        """Re-open expected chat if a model switch navigation moved the user away."""
+        target_id = chat.chat_id or extract_chat_id(chat.url)
+        if not target_id:
             return
+        current_id = extract_chat_id(self.page.url)
+        if current_id == target_id:
+            chat.url = self.page.url
+            chat.chat_id = current_id
+            return
+
+        target_url = normalize_chat_url(self.config.base_url, target_id)
+        self._log.warn(
+            "Re-opening target chat after model switch popup: "
+            f"{target_url}"
+        )
+        try:
+            await self._navigate_with_retries(target_url)
+            await self._short_pause(300)
+        except Exception as exc:
+            self._log.warn(f"Failed to navigate back to chat after model switch: {exc}")
+            return
+
+        deadline = asyncio.get_running_loop().time() + 6.0
+        while asyncio.get_running_loop().time() < deadline:
+            current_id = extract_chat_id(self.page.url)
+            if current_id == target_id:
+                chat.url = self.page.url
+                chat.chat_id = current_id
+                self._log.info(f"Chat restored after model switch: {current_id}")
+                return
+            await asyncio.sleep(0.2)
+
+        self._log.warn(
+            "Could not confirm chat restoration after model switch popup. "
+            f"Current URL: {self.page.url}"
+        )
 
     @property
     def _has_session_target(self) -> bool:
+        """Whether session persistence is configured."""
         return self.config.session is not None
 
     def _load_session_state(self) -> dict[str, Any] | None:
+        """Load saved session storage state from disk if configured."""
         if not self._has_session_target:
             return None
         return self._session_store.load(session=self.config.session)
 
     def _load_cookies_state(self) -> dict[str, Any] | None:
+        """Load Playwright storage state generated from Netscape cookies file."""
         if not self.config.cookies_path:
             return None
         return load_storage_state_from_netscape(self.config.cookies_path)
 
     async def _resolve_window_size(self) -> None:
+        """Resolve final browser window dimensions with optional host auto-detection."""
         width = self.config.window_width
         height = self.config.window_height
 
@@ -393,6 +569,7 @@ class ZaiClient:
         self._window_height = height
 
     def _normalize_window_value(self, value: int | None, fallback: int) -> int:
+        """Normalize a window dimension into a positive integer."""
         if value is None:
             return fallback
         try:
@@ -402,6 +579,22 @@ class ZaiClient:
         return parsed if parsed > 0 else fallback
 
     def _detect_host_screen_size(self) -> tuple[int, int] | None:
+        """Detect host screen size using available platform-specific backends."""
+        detected = self._detect_screen_size_tkinter()
+        if detected is not None:
+            return detected
+
+        detected = self._detect_screen_size_windows()
+        if detected is not None:
+            return detected
+
+        detected = self._detect_screen_size_linux()
+        if detected is not None:
+            return detected
+        return None
+
+    def _detect_screen_size_tkinter(self) -> tuple[int, int] | None:
+        """Detect screen size via Tkinter (cross-platform, preferred fallback)."""
         try:
             import tkinter
         except Exception:
@@ -412,13 +605,92 @@ class ZaiClient:
             width = int(root.winfo_screenwidth())
             height = int(root.winfo_screenheight())
             root.destroy()
-            if width > 0 and height > 0:
+            if self._is_valid_screen_size(width, height):
                 return width, height
         except Exception:
             return None
         return None
 
+    def _detect_screen_size_windows(self) -> tuple[int, int] | None:
+        """Detect screen size via Win32 API on Windows hosts."""
+        try:
+            import ctypes
+            import platform
+
+            if platform.system().lower() != "windows":
+                return None
+            width = int(ctypes.windll.user32.GetSystemMetrics(0))
+            height = int(ctypes.windll.user32.GetSystemMetrics(1))
+            if self._is_valid_screen_size(width, height):
+                return width, height
+        except Exception:
+            return None
+        return None
+
+    def _detect_screen_size_linux(self) -> tuple[int, int] | None:
+        """Detect screen size on Linux via `xrandr`/`xdpyinfo` commands."""
+        try:
+            import platform
+
+            if platform.system().lower() != "linux":
+                return None
+        except Exception:
+            return None
+
+        # xrandr: "current 1920 x 1080"
+        parsed = self._read_screen_size_from_command(
+            ["xrandr", "--current"],
+            re.compile(r"current\s+(\d+)\s+x\s+(\d+)", re.I),
+        )
+        if parsed is not None:
+            return parsed
+
+        # xdpyinfo: "dimensions:    1920x1080 pixels"
+        parsed = self._read_screen_size_from_command(
+            ["xdpyinfo"],
+            re.compile(r"dimensions:\s+(\d+)x(\d+)\s+pixels", re.I),
+        )
+        if parsed is not None:
+            return parsed
+        return None
+
+    def _read_screen_size_from_command(
+        self,
+        command: list[str],
+        pattern: re.Pattern[str],
+    ) -> tuple[int, int] | None:
+        """Run a command and parse screen dimensions from its output."""
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            output = (result.stdout or "").strip()
+            if not output:
+                return None
+            match = pattern.search(output)
+            if not match:
+                return None
+            width = int(match.group(1))
+            height = int(match.group(2))
+            if self._is_valid_screen_size(width, height):
+                return width, height
+        except Exception:
+            return None
+        return None
+
+    def _is_valid_screen_size(self, width: int, height: int) -> bool:
+        """Return `True` when width and height are positive numbers."""
+        return width > 0 and height > 0
+
     async def _launch_browser_engine(self) -> None:
+        """Start Camoufox or Playwright browser engine according to config."""
         if self.config.use_camoufox:
             try:
                 from camoufox.async_api import AsyncCamoufox
@@ -455,6 +727,7 @@ class ZaiClient:
         self._browser = await self._playwright.chromium.launch(**launch_args)
 
     async def _new_context_and_page(self, storage_state: dict[str, Any] | None = None) -> None:
+        """Create a fresh context/page and optionally preload storage state."""
         if self._browser is None and self._context is None:
             raise RuntimeError("Browser is not started.")
 
@@ -491,6 +764,7 @@ class ZaiClient:
         self._page = await self._context.new_page()
 
     async def _navigate_with_retries(self, url: str) -> None:
+        """Navigate with retry logic and robust load-state waits."""
         last_error: Exception | None = None
         for attempt in range(1, self.config.navigation_retries + 1):
             try:
@@ -541,16 +815,18 @@ class ZaiClient:
         target_id = extract_chat_id(target_url)
         if not target_id:
             raise ChatNavigationError(f"Invalid chat reference: {chat_ref}")
+        target_chat = ChatSession(client=self, url=target_url, chat_id=target_id)
         self._log.info(f"Opening chat: {target_url}")
-        await self._dismiss_startup_popup_silent()
+        await self._dismiss_startup_popup_silent(chat=target_chat)
         if self.page.url.rstrip("/") != target_url.rstrip("/"):
             await self.open(target_url)
-        await self._dismiss_startup_popup_silent()
+        await self._dismiss_startup_popup_silent(chat=target_chat)
         await self._short_pause(250)
 
         # Stabilize URL to catch delayed SPA redirects for invalid/deleted chats.
         stable_hits = 0
         for _ in range(20):
+            await self._dismiss_startup_popup_silent(chat=target_chat)
             current_url = self.page.url
             current_url_norm = current_url.rstrip("/")
             current_id = extract_chat_id(current_url)
@@ -600,6 +876,7 @@ class ZaiClient:
         )
 
     async def _ensure_chat_open(self, chat: ChatSession) -> None:
+        """Ensure that the current page points to the target chat session."""
         target_id = chat.chat_id or extract_chat_id(chat.url)
         if target_id is None:
             return
@@ -619,7 +896,8 @@ class ZaiClient:
         deep_think: bool | None = None,
         web_search: bool | None = None,
     ) -> ChatMessage:
-        await self._dismiss_startup_popup_silent()
+        """Send one prompt and wait until response tracking is fully completed."""
+        await self._dismiss_startup_popup_silent(chat=chat)
         if not text.strip():
             raise ValueError("Message text must not be empty.")
 
@@ -662,6 +940,7 @@ class ZaiClient:
         await self._wait_send_button_ready(send_button, timeout_ms=8_000)
 
         previous_url = self.page.url
+        started_monotonic = time.monotonic()
         await send_button.click()
         message.generation_started_at = datetime.now()
         self._log.info("Message submitted. Waiting for generation to finish")
@@ -669,6 +948,7 @@ class ZaiClient:
             await self.page.wait_for_url("**/c/*", timeout=8_000)
         except Exception:
             pass
+        await self._dismiss_startup_popup_silent(chat=chat)
         chat.url = self.page.url
         chat.chat_id = extract_chat_id(self.page.url)
         if previous_url != self.page.url:
@@ -690,6 +970,9 @@ class ZaiClient:
                     message.generation_finished_at - message.generation_started_at
                 ).total_seconds()
             self._log.error(f"Message tracking failed: {exc}")
+        total_elapsed = time.monotonic() - started_monotonic
+        if message.generation_seconds is None or total_elapsed > message.generation_seconds:
+            message.generation_seconds = total_elapsed
         if message.ok:
             self._log.ok(
                 f"Response ready: {message.response_chars} chars in {message.generation_seconds:.1f}s"
@@ -702,6 +985,7 @@ class ZaiClient:
         return message
 
     async def _resolve_input_box(self) -> Locator | None:
+        """Find the currently visible composer input element."""
         selectors = (
             S.CHAT_INPUT_TEXTAREA,
             "textarea",
@@ -715,13 +999,20 @@ class ZaiClient:
         return None
 
     async def _wait_composer_ready(self, timeout_ms: int) -> None:
+        """Wait until chat composer controls are available for interaction."""
         # Core readiness: input + send button zone.
-        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + (timeout_ms / 1000)
+        next_popup_check = 0.0
         while True:
+            now = loop.time()
+            if now >= next_popup_check:
+                await self._dismiss_startup_popup_silent()
+                next_popup_check = now + 0.5
             box = await self._resolve_input_box()
             if box is not None:
                 break
-            if asyncio.get_running_loop().time() >= deadline:
+            if now >= deadline:
                 raise ChatNavigationError("Composer input did not become visible in time.")
             await asyncio.sleep(0.1)
 
@@ -741,6 +1032,7 @@ class ZaiClient:
                 self._log.warn("Chat mode tab not visible yet. Continuing")
 
     def _response_containers(self):
+        """Return locator for all assistant response containers on the page."""
         return self.page.locator(S.RESPONSE_CONTAINER)
 
     async def _wait_for_response_container(
@@ -748,6 +1040,7 @@ class ZaiClient:
         previous_count: int | None,
         timeout_ms: int = 18_000,
     ) -> Locator:
+        """Wait for the newly created response container after message submit."""
         deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
         containers = self._response_containers()
         while True:
@@ -777,37 +1070,54 @@ class ZaiClient:
             await asyncio.sleep(0.12)
 
     async def _extract_response_text(self, container: Locator) -> str:
+        """Extract assistant text while filtering thinking/search UI artifacts."""
         prose = container.locator(".markdown-prose").first
         if await prose.count() > 0:
-            raw = (
-                await prose.evaluate(
-                    """(el) => {
-                        const root = el.cloneNode(true);
-                        root.querySelectorAll(
-                          '.thinking-chain-container, .thinking-block, blockquote[slot="content"]'
-                        ).forEach((node) => node.remove());
-                        const blocks = [];
-                        root.querySelectorAll('p, li, blockquote, pre, h1, h2, h3, h4, h5, h6')
-                          .forEach((node) => {
-                            const text = (node.innerText || '').trim();
-                            if (text) blocks.push(text);
-                          });
-                        if (blocks.length > 0) {
-                          return blocks.join('\\n\\n');
-                        }
-                        return (root.innerText || '').trim();
-                    }"""
+            try:
+                raw = (
+                    await prose.evaluate(
+                        """(el) => {
+                            const root = el.cloneNode(true);
+                            root.querySelectorAll(
+                              '.thinking-chain-container, .thinking-block, blockquote[slot="content"]'
+                            ).forEach((node) => node.remove());
+                            const blocks = [];
+                            root.querySelectorAll('p, li, blockquote, pre, h1, h2, h3, h4, h5, h6')
+                              .forEach((node) => {
+                                const text = (node.innerText || '').trim();
+                                if (text) blocks.push(text);
+                              });
+                            if (blocks.length > 0) {
+                              return blocks.join('\\n\\n');
+                            }
+                            return (root.innerText || '').trim();
+                        }"""
+                    )
+                    or ""
+                ).strip()
+                raw = re.sub(r"[ \t]+\n", "\n", raw)
+                raw = re.sub(r"(?im)^\s*Searching the web\s*$", "", raw)
+                raw = re.sub(
+                    r"(?im)^\s*(Thought Process|Thinking(?:\.\.\.)?|Searching the web)\s*$",
+                    "",
+                    raw,
                 )
-                or ""
-            ).strip()
-            raw = re.sub(r"[ \t]+\n", "\n", raw)
-            raw = re.sub(r"(?im)^\s*Searching the web\s*$", "", raw)
-            raw = re.sub(r"\n{3,}", "\n\n", raw)
-            return raw.strip()
-        raw = (await container.inner_text() or "").strip()
-        return raw
+                raw = re.sub(r"\n{3,}", "\n\n", raw)
+                return raw.strip()
+            except Exception:
+                # Non-critical while response is still streaming; fallback below.
+                pass
+        text = await self._safe_locator_inner_text(container, timeout_ms=800)
+        text = re.sub(
+            r"(?im)^\s*(Thought Process|Thinking(?:\.\.\.)?|Searching the web)\s*$",
+            "",
+            text,
+        )
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     async def _is_response_generating(self, container: Locator) -> bool:
+        """Check if dot animation indicates active token generation."""
         dots = container.locator(S.GEN_DOT)
         count = await dots.count()
         if count == 0:
@@ -818,6 +1128,7 @@ class ZaiClient:
         return False
 
     async def _is_response_busy(self, container: Locator) -> bool:
+        """Return whether any response phase (generate/think/search) is active."""
         if await self._is_response_generating(container):
             return True
         if await self._is_thinking_active(container):
@@ -832,6 +1143,7 @@ class ZaiClient:
         message: ChatMessage,
         container: Locator,
     ) -> ChatMessage:
+        """Track response lifecycle until stable completion or terminal error."""
         start = time.monotonic()
         last_change = start
         last_text = ""
@@ -842,9 +1154,22 @@ class ZaiClient:
         thinking_was_active = False
         web_search_was_active = False
         seen_busy_signal = False
+        last_busy_signal_at = start
+        done_candidate_at: float | None = None
+        saw_reasoning_signal = False
 
         while True:
-            await self._dismiss_startup_popup_silent()
+            # Popups can interrupt page context mid-generation; recover container if needed.
+            popup_switched_model = await self._dismiss_startup_popup_silent(chat=chat)
+            if popup_switched_model:
+                prefix = (message.response_text or "")[:80]
+                try:
+                    container = await self._recover_response_container(prefix=prefix)
+                except Exception as exc:
+                    self._log.warn(
+                        "Could not re-bind response container after model switch popup: "
+                        f"{exc}"
+                    )
             current_text = await self._extract_response_text(container)
             if current_text != last_text:
                 last_text = current_text
@@ -858,8 +1183,13 @@ class ZaiClient:
             generating = await self._is_response_generating(container)
             thinking_active = await self._is_thinking_active(container)
             web_search_active = await self._is_web_search_active(container)
+            now = time.monotonic()
             if generating or thinking_active or web_search_active:
                 seen_busy_signal = True
+                last_busy_signal_at = now
+                done_candidate_at = None
+            if thinking_active or web_search_active:
+                saw_reasoning_signal = True
             thinking_text = await self._extract_thinking_text(container)
             web_search_text = await self._extract_web_search_text(container)
             if (
@@ -887,8 +1217,9 @@ class ZaiClient:
                 last_web_search_text = web_search_text
                 self._log.info(f"Web search: {web_search_text}")
 
-            elapsed = time.monotonic() - start
-            stalled_for = time.monotonic() - last_change
+            elapsed = now - start
+            stalled_for = now - last_change
+            idle_after_busy = now - last_busy_signal_at
 
             if (
                 web_search_active
@@ -917,6 +1248,37 @@ class ZaiClient:
                 and not web_search_active
                 and message.response_chars > 0
             ):
+                # Require a stability window to avoid premature completion on delayed updates.
+                stable_required = (
+                    self._GEN_DONE_STABLE_REASONING_SECONDS
+                    if saw_reasoning_signal
+                    else self._GEN_DONE_STABLE_SECONDS
+                )
+                if done_candidate_at is None:
+                    done_candidate_at = now
+                    await asyncio.sleep(0.2)
+                    continue
+                if (now - last_change) < stable_required:
+                    await asyncio.sleep(0.2)
+                    continue
+                if (now - done_candidate_at) < stable_required:
+                    await asyncio.sleep(0.2)
+                    continue
+                await asyncio.sleep(0.8)
+                verify_text = await self._extract_response_text(container)
+                verify_generating = await self._is_response_generating(container)
+                verify_thinking = await self._is_thinking_active(container)
+                verify_web_search = await self._is_web_search_active(container)
+                if verify_text != last_text:
+                    last_text = verify_text
+                    message.response_text = verify_text
+                    message.response_chars = len(verify_text)
+                    last_change = time.monotonic()
+                    done_candidate_at = None
+                    continue
+                if verify_generating or verify_thinking or verify_web_search:
+                    done_candidate_at = None
+                    continue
                 break
             if (
                 not generating
@@ -924,10 +1286,34 @@ class ZaiClient:
                 and not web_search_active
                 and message.response_chars == 0
                 and seen_busy_signal
-                and stalled_for > 4.0
+                and elapsed > 20.0
+                and stalled_for > 14.0
+                and idle_after_busy > 8.0
             ):
+                await asyncio.sleep(1.0)
+                retry_text = await self._extract_response_text(container)
+                if retry_text != last_text:
+                    last_text = retry_text
+                    message.response_text = retry_text
+                    message.response_chars = len(retry_text)
+                    last_change = time.monotonic()
+                    if message.response_chars > 0:
+                        self._log.info(
+                            "Empty-response check recovered: text appeared after grace wait."
+                        )
+                    continue
+                retry_generating = await self._is_response_generating(container)
+                retry_thinking = await self._is_thinking_active(container)
+                retry_web_search = await self._is_web_search_active(container)
+                if retry_generating or retry_thinking or retry_web_search:
+                    self._log.info(
+                        "Empty-response check recovered: response activity resumed."
+                    )
+                    continue
                 message.error = "Assistant returned an empty response."
                 break
+            else:
+                done_candidate_at = None
 
             if elapsed > self._GEN_TOTAL_TIMEOUT_SECONDS:
                 message.error = "Generation timeout exceeded."
@@ -966,19 +1352,41 @@ class ZaiClient:
         return message
 
     async def _extract_thinking_text(self, container: Locator) -> str:
+        """Extract the latest visible text from the deep-think status area."""
         chain = container.locator(S.THINKING_CONTAINER).first
-        if await chain.count() == 0 or not await chain.is_visible():
+        if await chain.count() == 0:
+            return ""
+        try:
+            if not await chain.is_visible():
+                return ""
+        except Exception:
             return ""
 
         # Active state uses shimmer text (e.g. "Thinking...").
         specific = chain.locator(S.THINKING_SHIMMER).first
-        if await specific.count() > 0 and await specific.is_visible():
-            text = (await specific.inner_text() or "").strip()
+        if await specific.count() > 0:
+            try:
+                if not await specific.is_visible():
+                    return ""
+            except Exception:
+                return ""
+            text = await self._safe_locator_inner_text(specific, timeout_ms=450)
             if text:
                 return re.sub(r"\s+", " ", text)
+        # Fallback: shimmer may be re-rendered; inspect any visible span in thinking container.
+        fallback = chain.locator("span").first
+        if await fallback.count() > 0:
+            try:
+                if await fallback.is_visible():
+                    text = await self._safe_locator_inner_text(fallback, timeout_ms=350)
+                    if text:
+                        return re.sub(r"\s+", " ", text)
+            except Exception:
+                return ""
         return ""
 
     async def _is_thinking_active(self, container: Locator) -> bool:
+        """Detect active deep-think phase from shimmer/skip UI markers."""
         chain = container.locator(S.THINKING_CONTAINER).first
         if await chain.count() == 0 or not await chain.is_visible():
             return False
@@ -995,19 +1403,34 @@ class ZaiClient:
         return False
 
     async def _extract_web_search_text(self, container: Locator) -> str:
+        """Extract visible web-search status text from the response block."""
         label = container.locator(S.THINKING_SHIMMER, has_text=re.compile("Searching the web", re.I)).first
-        if await label.count() == 0 or not await label.is_visible():
+        if await label.count() == 0:
             return ""
-        text = (await label.inner_text() or "").strip()
+        try:
+            if not await label.is_visible():
+                return ""
+        except Exception:
+            return ""
+        text = await self._safe_locator_inner_text(label, timeout_ms=450)
         if not text:
             return ""
         return re.sub(r"\s+", " ", text)
 
+    async def _safe_locator_inner_text(self, locator: Locator, timeout_ms: int = 500) -> str:
+        """Read locator inner text safely, returning empty string on transient failures."""
+        try:
+            return (await locator.inner_text(timeout=timeout_ms) or "").strip()
+        except Exception:
+            return ""
+
     async def _is_web_search_active(self, container: Locator) -> bool:
+        """Detect active web-search phase from response status label."""
         label = container.locator(S.THINKING_SHIMMER, has_text=re.compile("Searching the web", re.I)).first
         return await label.count() > 0 and await label.is_visible()
 
     async def _recover_response_container(self, prefix: str) -> Locator:
+        """Recover the most likely response container after reload/navigation."""
         containers = self._response_containers()
         await containers.first.wait_for(state="visible", timeout=self.config.timeout_ms)
         count = await containers.count()
@@ -1023,15 +1446,28 @@ class ZaiClient:
         return containers.nth(count - 1)
 
     async def _reload_chat_page(self) -> None:
+        """Reload current page with fallback navigation when reload is unstable."""
         current_url = self.page.url
         try:
-            await self.page.reload(wait_until="load", timeout=self.config.timeout_ms)
+            await self.page.reload(
+                wait_until="domcontentloaded",
+                timeout=min(20_000, self.config.timeout_ms),
+            )
+            try:
+                await self.page.wait_for_load_state("load", timeout=min(6_000, self.config.timeout_ms))
+            except Exception:
+                # Dynamic pages may keep loading forever; domcontentloaded is enough here.
+                pass
         except Exception as exc:
-            self._log.warn(f"Reload failed ({exc}). Retrying with direct navigation")
+            self._log.info(
+                "Reload did not complete normally. "
+                f"Falling back to direct navigation ({exc.__class__.__name__})"
+            )
             await self._navigate_with_retries(current_url)
         self._log.info(f"Page refreshed: {self.page.url}")
 
     async def _get_last_assistant_message_dom_id(self) -> str | None:
+        """Return DOM id of the last assistant message wrapper, if present."""
         wrappers = self.page.locator("div[id^='message-']").filter(
             has=self.page.locator(".chat-assistant")
         )
@@ -1045,6 +1481,7 @@ class ZaiClient:
         send_button: Locator,
         timeout_ms: int = 8_000,
     ) -> None:
+        """Wait until send button becomes enabled and not marked disabled."""
         await send_button.wait_for(state="visible", timeout=timeout_ms)
         deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
         while True:
@@ -1063,6 +1500,8 @@ class ZaiClient:
             await asyncio.sleep(0.1)
 
     async def _regenerate_message(self, message: ChatMessage) -> ChatMessage:
+        """Trigger regeneration and collect the refreshed assistant response."""
+        started_monotonic = time.monotonic()
         regenerated = ChatMessage(
             client=self,
             chat=message.chat,
@@ -1094,6 +1533,9 @@ class ZaiClient:
                 regenerated.generation_finished_at - regenerated.generation_started_at
             ).total_seconds()
             self._log.error(f"Regeneration tracking failed: {exc}")
+        total_elapsed = time.monotonic() - started_monotonic
+        if regenerated.generation_seconds is None or total_elapsed > regenerated.generation_seconds:
+            regenerated.generation_seconds = total_elapsed
         if regenerated.ok:
             self._log.ok(
                 f"Regeneration complete: {regenerated.response_chars} chars "
@@ -1104,6 +1546,7 @@ class ZaiClient:
         return regenerated
 
     async def _resolve_regenerate_button(self, message: ChatMessage) -> Locator:
+        """Locate regenerate button for the target message, with safe fallback."""
         if message.assistant_message_dom_id:
             wrapper = self.page.locator(f"#{message.assistant_message_dom_id}").first
             if await wrapper.count() > 0:
@@ -1116,6 +1559,7 @@ class ZaiClient:
         return button
 
     async def _resolve_regeneration_container(self, message: ChatMessage) -> Locator:
+        """Resolve response container to monitor after regeneration click."""
         if message.assistant_message_dom_id:
             wrapper = self.page.locator(f"#{message.assistant_message_dom_id}").first
             if await wrapper.count() > 0:
@@ -1129,21 +1573,55 @@ class ZaiClient:
         return containers.nth(count - 1)
 
     async def _click_new_chat_button(self) -> None:
+        """Open new-chat composer with retries and popup/sidebar recovery."""
         await self._dismiss_startup_popup_silent()
-        await self._ensure_sidebar_open()
-        button = self.page.locator(S.NEW_CHAT_BUTTON_ID).first
-        if await button.count() == 0:
-            button = self.page.get_by_role("button", name=S.NEW_CHAT_BUTTON_NAME).first
-        if await button.count() == 0:
-            raise ChatNavigationError("New Chat button not found.")
-        await self._wait_clickable(button, "New Chat button")
-        await button.scroll_into_view_if_needed()
-        await button.click()
-        await self._short_pause()
-        await self.page.wait_for_load_state("domcontentloaded")
-        await self._wait_composer_ready(timeout_ms=self.config.timeout_ms)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(8.0, self.config.timeout_ms / 1000)
+        next_popup_check = 0.0
+
+        while True:
+            now = loop.time()
+            if now >= next_popup_check:
+                await self._dismiss_startup_popup_silent()
+                next_popup_check = now + 0.6
+
+            try:
+                await self._ensure_sidebar_open()
+            except Exception as exc:
+                if now >= deadline:
+                    raise ChatNavigationError("Failed to open sidebar while creating a new chat.") from exc
+                await asyncio.sleep(0.2)
+                continue
+
+            button = self.page.locator(S.NEW_CHAT_BUTTON_ID).first
+            if await button.count() == 0:
+                button = self.page.get_by_role("button", name=S.NEW_CHAT_BUTTON_NAME).first
+
+            if await button.count() > 0 and await button.is_visible():
+                try:
+                    await self._wait_clickable(button, "New Chat button")
+                    await button.scroll_into_view_if_needed()
+                    await button.click()
+                    await self._short_pause()
+                    await self.page.wait_for_load_state("domcontentloaded")
+                    await self._wait_composer_ready(timeout_ms=self.config.timeout_ms)
+                    return
+                except Exception as exc:
+                    await self._dismiss_startup_popup_silent()
+                    if now >= deadline:
+                        raise ChatNavigationError(
+                            "Failed to open new chat composer after retries."
+                        ) from exc
+                    await asyncio.sleep(0.2)
+                    continue
+
+            if now >= deadline:
+                raise ChatNavigationError("New Chat button not found.")
+
+            await asyncio.sleep(0.2)
 
     async def _ensure_chat_mode(self, mode: str = "chat", strict: bool = False) -> None:
+        """Ensure chat mode is active; raise on unsupported modes."""
         normalized = mode.strip().lower()
         if normalized != "chat":
             raise UnsupportedChatModeError("Currently only 'chat' mode is supported.")
@@ -1165,6 +1643,7 @@ class ZaiClient:
             self._log.warn("Could not confirm Chat mode state. Continuing")
 
     async def _select_model(self, model: str) -> None:
+        """Select an exact model name from selector, including hidden list."""
         desired = model.strip()
         if not desired:
             raise ValueError("Model value must not be empty.")
@@ -1224,6 +1703,7 @@ class ZaiClient:
         self._log.ok(f"Model selected: {selected_name}")
 
     async def _find_model_button(self, menu: Locator, model: str) -> Locator | None:
+        """Find exact model item by `data-value` or first visible text line."""
         target = model.strip()
         items = menu.locator(S.MODEL_ITEM_BUTTON)
         count = await items.count()
@@ -1240,6 +1720,7 @@ class ZaiClient:
         return None
 
     async def _get_current_model_label(self) -> str | None:
+        """Read currently selected model label from selector button."""
         selector_button = self.page.locator(S.MODEL_SELECTOR_BUTTON).first
         if await selector_button.count() == 0:
             selector_button = self.page.locator(S.MODEL_SELECTOR_BUTTON_FALLBACK).first
@@ -1259,6 +1740,7 @@ class ZaiClient:
         element_name: str,
         timeout_ms: int | None = None,
     ) -> None:
+        """Wait until an element is visible, enabled, and not disabled by attrs."""
         timeout = timeout_ms or self.config.timeout_ms
         await locator.wait_for(state="visible", timeout=timeout)
         deadline = asyncio.get_running_loop().time() + (timeout / 1000)
@@ -1279,6 +1761,7 @@ class ZaiClient:
         expected: str,
         timeout_ms: int = 3_000,
     ) -> str | None:
+        """Poll for attribute value until expected state or timeout."""
         deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
         while True:
             value = await locator.get_attribute(name)
@@ -1289,6 +1772,7 @@ class ZaiClient:
             await asyncio.sleep(0.08)
 
     async def _short_pause(self, ms: int = 140) -> None:
+        """Sleep helper for short UI pacing pauses."""
         await asyncio.sleep(ms / 1000)
 
     async def _before_chat_action(
@@ -1297,6 +1781,7 @@ class ZaiClient:
         action_name: str,
         pace: bool = False,
     ) -> None:
+        """Apply optional human-like pacing before chat-scoped action execution."""
         if not pace or not self.config.humanize_actions:
             return
 
@@ -1324,11 +1809,13 @@ class ZaiClient:
             await asyncio.sleep(sleep_for)
 
     def _after_chat_action(self, chat: ChatSession, action_name: str) -> None:
+        """Record timing metadata after a chat-scoped action is executed."""
         chat.last_action_monotonic = time.monotonic()
         chat.last_action_at = datetime.now()
         chat.last_action_name = action_name
 
     async def _get_deep_think(self) -> bool:
+        """Return current deep-think toggle state from composer controls."""
         await self._dismiss_startup_popup_silent()
         button = self.page.locator(S.DEEP_THINK_BUTTON).first
         if await button.count() == 0:
@@ -1337,6 +1824,7 @@ class ZaiClient:
         return (state or "").lower() == "true"
 
     async def _set_deep_think(self, enabled: bool) -> bool:
+        """Set deep-think toggle and verify final state."""
         await self._dismiss_startup_popup_silent()
         button = self.page.locator(S.DEEP_THINK_BUTTON).first
         if await button.count() == 0:
@@ -1355,6 +1843,7 @@ class ZaiClient:
         raise ChatNavigationError("Failed to switch Deep think state.")
 
     async def _resolve_web_search_toggle(self) -> Locator:
+        """Resolve the effective web-search toggle button in current layout."""
         # Primary strategy: same controls row as Deep think button.
         deep_think_button = self.page.locator(S.DEEP_THINK_BUTTON).first
         if await deep_think_button.count() > 0 and await deep_think_button.is_visible():
@@ -1417,6 +1906,7 @@ class ZaiClient:
         raise ChatNavigationError("Visible web search toggle button not found.")
 
     async def _get_web_search(self) -> bool:
+        """Return current web-search toggle state based on active CSS state."""
         await self._dismiss_startup_popup_silent()
         button = await self._resolve_web_search_toggle()
         class_attr = (await button.get_attribute("class") or "").lower()
@@ -1426,6 +1916,7 @@ class ZaiClient:
         )
 
     async def _set_web_search(self, enabled: bool) -> bool:
+        """Set web-search toggle state and verify result."""
         await self._dismiss_startup_popup_silent()
         button = await self._resolve_web_search_toggle()
         await self._wait_clickable(button, "Web search toggle", timeout_ms=4_000)
@@ -1483,6 +1974,7 @@ class ZaiClient:
             )
 
         self._log.warn(f"Deleting chat: {target_id or 'no-id'}")
+        await self._dismiss_startup_popup_silent(chat=target_chat)
 
         last_exc: Exception | None = None
         for attempt in range(1, 3):
@@ -1547,6 +2039,7 @@ class ZaiClient:
         return deleted
 
     async def _open_current_chat_menu(self) -> None:
+        """Open contextual menu for the currently selected chat in sidebar."""
         await self._dismiss_startup_popup_silent()
         await self._ensure_sidebar_open()
         menus = self.page.locator(S.CHAT_MENU_BUTTON)
@@ -1559,6 +2052,7 @@ class ZaiClient:
         await self._short_pause(140)
 
     async def _wait_chat_deleted(self, target_id: str, timeout_ms: int = 12_000) -> bool:
+        """Wait until current URL no longer points to the deleted chat id."""
         deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
         while True:
             current_id = extract_chat_id(self.page.url)
@@ -1569,6 +2063,7 @@ class ZaiClient:
             await asyncio.sleep(0.2)
 
     async def _wait_delete_modal_closed(self, timeout_ms: int = 6_000) -> bool:
+        """Wait until delete confirmation modal disappears."""
         deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
         while True:
             confirm_button = self.page.get_by_role("button", name=re.compile(r"^\s*Confirm\s*$", re.I)).last
@@ -1581,6 +2076,7 @@ class ZaiClient:
             await asyncio.sleep(0.2)
 
     async def _first_visible(self, locator: Locator) -> Locator | None:
+        """Return first visible element from a locator collection."""
         count = await locator.count()
         for i in range(count):
             item = locator.nth(i)
@@ -1589,6 +2085,7 @@ class ZaiClient:
         return None
 
     async def _ensure_sidebar_open(self) -> None:
+        """Open sidebar if it is currently collapsed."""
         # Closed sidebar has explicit toggle button with this id.
         closed_toggle = self.page.locator(S.SIDEBAR_TOGGLE_BUTTON).first
         if await closed_toggle.count() > 0 and await closed_toggle.is_visible():
@@ -1603,9 +2100,17 @@ class ZaiClient:
                     return
                 await asyncio.sleep(0.1)
 
-    async def _dismiss_startup_popup_silent(self) -> None:
+    async def _dismiss_startup_popup_silent(
+        self,
+        chat: ChatSession | None = None,
+        allow_chat_restore: bool = True,
+    ) -> bool:
+        """Best-effort popup dismissal wrapper that never raises."""
         try:
-            await self._dismiss_startup_popup()
+            return await self._dismiss_startup_popup(
+                chat=chat,
+                allow_chat_restore=allow_chat_restore,
+            )
         except Exception:
             # Non-critical helper; ignore transient failures.
-            return
+            return False

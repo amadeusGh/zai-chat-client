@@ -15,9 +15,11 @@ class ColorLogger:
     RED = "\033[91m"
 
     def __init__(self, enabled: bool = True) -> None:
+        """Create a logger that can be fully muted with `enabled=False`."""
         self.enabled = enabled
 
     def _emit(self, color: str, level: str, message: str) -> None:
+        """Render a timestamped log line with optional ANSI color styling."""
         ts = datetime.now().strftime("%H:%M:%S")
         if not self.enabled:
             print(f"[{ts}] [{level}] {message}")
@@ -28,13 +30,17 @@ class ColorLogger:
         )
 
     def info(self, message: str) -> None:
+        """Log an informational event."""
         self._emit(self.BLUE, "INFO", message)
 
     def ok(self, message: str) -> None:
+        """Log a successful operation."""
         self._emit(self.GREEN, "OK", message)
 
     def warn(self, message: str) -> None:
+        """Log a recoverable warning."""
         self._emit(self.YELLOW, "WARN", message)
 
     def error(self, message: str) -> None:
+        """Log a failure condition."""
         self._emit(self.RED, "ERROR", message)

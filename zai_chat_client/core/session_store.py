@@ -13,6 +13,7 @@ _SESSION_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _safe_session_name(session_name: str) -> str:
+    """Normalize a user session alias so it can be safely used as a filename."""
     cleaned = _SESSION_NAME_RE.sub("_", session_name).strip("._")
     if not cleaned:
         raise SessionStateError("Session name is empty after sanitization.")
@@ -23,6 +24,7 @@ class SessionStore:
     """Load/save Playwright storage state by session name or explicit path."""
 
     def __init__(self, base_dir: Path | None = None) -> None:
+        """Create a session store rooted at `.sessions` unless overridden."""
         default_dir = Path.cwd() / ".sessions"
         self.base_dir = base_dir or default_dir
 
