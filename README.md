@@ -296,8 +296,8 @@ client = ZaiClient(...)
 | `await close()`                    | `—`                                                                               | `None`          | Gracefully closes the browser and releases Playwright resources.                               |
 | `await open(url)`                  | `url: str`                                                                        | `None`          | Navigates the browser to a specific URL using retry logic.                                     |
 | `await save_session()`             | `—`                                                                               | `None`          | Saves the current browser storage state to the configured session file.                        |
-| `await create_chat(...)`           | `model: str \| None`, `mode: str`, `deep_think: bool \| None`, `web_search: bool \| None` | `ChatSession` | Creates a new chat and returns a `ChatSession` object.                                         |
-| `await open_chat(chat_ref)`        | `chat_ref: str`                                                                   | `ChatSession`   | Opens an existing chat using a chat id or full URL.                                            |
+| `await create_chat(...)`           | `model: str \| None`, `mode: str`, `deep_think: bool \| None`, `web_search: bool \| None` | `ChatSession` | Creates a new chat and returns a `ChatSession` object (history list is initialized).            |
+| `await open_chat(chat_ref)`        | `chat_ref: str`                                                                   | `ChatSession`   | Opens an existing chat using a chat id or full URL and loads message history into `chat.messages`. |
 | `await send_message(...)`          | `text: str`, `deep_think: bool \| None`, `web_search: bool \| None`             | `ChatMessage`   | Sends a message in the currently opened chat page and returns a `ChatMessage`.                 |
 | `await regenerate_last_response()` | `—`                                                                               | `ChatMessage`   | Regenerates the latest assistant response in the current chat.                                 |
 | `await delete_chat(chat_ref)`      | `chat_ref: str \| ChatSession \| None = None`                                    | `bool`          | Deletes a chat by id, URL, `ChatSession`, or current chat context.                             |
@@ -309,6 +309,16 @@ client = ZaiClient(...)
 `ChatSession` represents one specific chat in chat.z.ai.
 
 Most real interactions with the assistant happen through this object.
+
+### `ChatSession` fields
+
+| Field              | Type                     | Description                                                                 |
+| ------------------ | ------------------------ | --------------------------------------------------------------------------- |
+| `chat_id`          | `str \| None`            | Current chat id extracted from URL.                                         |
+| `url`              | `str`                    | Current chat URL.                                                           |
+| `messages`         | `list[ChatHistoryEntry]` | In-memory history snapshot of user/assistant messages for this chat.        |
+| `last_action_at`   | `datetime \| None`       | Timestamp of the last chat action executed by automation.                   |
+| `last_action_name` | `str \| None`            | Name of the last executed chat action method.                               |
 
 ---
 
@@ -322,6 +332,7 @@ Most real interactions with the assistant happen through this object.
 | `await set_web_search(enabled)` | `enabled: bool`                                               | `bool`        | Enables or disables Web Search mode.                                                                             |
 | `await get_web_search()`        | `—`                                                           | `bool`        | Returns the current Web Search state.                                                                            |
 | `await send_message(text, ...)` | `text: str`, `deep_think: bool \| None`, `web_search: bool \| None` | `ChatMessage` | Sends a message in the chat and waits until the assistant finishes generating a response.                       |
+| `await refresh_messages()`      | `—`                                                           | `list[ChatHistoryEntry]` | Re-reads the current chat DOM and refreshes `chat.messages`.                                         |
 | `await delete()`                | `—`                                                           | `bool`        | Deletes this chat from the chat list.                                                                            |
 
 `ChatSession` also tracks internal action timing fields such as `last_action_at` and `last_action_name`, which are useful for debugging or automation pacing.
@@ -358,6 +369,35 @@ It contains both the generated text and metadata describing how the generation h
 | Method               | Arguments (types) | Returns       | Description                                                                             |
 | -------------------- | ----------------- | ------------- | --------------------------------------------------------------------------------------- |
 | `await regenerate()` | `—`               | `ChatMessage` | Regenerates the assistant response for the same prompt and returns a new `ChatMessage`. |
+
+---
+
+### `ChatHistoryEntry`
+
+`ChatHistoryEntry` represents one item in `chat.messages` and can be either a user or assistant message.
+
+### `ChatHistoryEntry` fields
+
+| Field                    | Type               | Description                                                                 |
+| ------------------------ | ------------------ | --------------------------------------------------------------------------- |
+| `role`                   | `str`              | Message role: `"user"` or `"assistant"`.                                    |
+| `text`                   | `str`              | Message text extracted from chat UI.                                        |
+| `dom_id`                 | `str \| None`      | DOM id of the message block (`message-...`) when available.                 |
+| `response_chars`         | `int`              | Character count of `text`.                                                  |
+| `generation_started_at`  | `datetime \| None` | Filled for tracked assistant generations when available.                     |
+| `generation_finished_at` | `datetime \| None` | Filled for tracked assistant generations when available.                     |
+| `generation_seconds`     | `float \| None`    | Filled for tracked assistant generations when available.                     |
+| `error`                  | `str \| None`      | Error text for tracked assistant generations, if any.                        |
+| `source_message`         | `ChatMessage \| None` | Linked tracked `ChatMessage` object when this history item is trackable.  |
+| `is_user`                | `bool`             | Convenience flag for user entries.                                          |
+| `is_assistant`           | `bool`             | Convenience flag for assistant entries.                                     |
+| `can_regenerate`         | `bool`             | `True` only if this entry is assistant and linked to a tracked message.     |
+
+### `ChatHistoryEntry` methods
+
+| Method               | Arguments (types) | Returns       | Description                                                                                     |
+| -------------------- | ----------------- | ------------- | ----------------------------------------------------------------------------------------------- |
+| `await regenerate()` | `—`               | `ChatMessage` | Regenerates this assistant entry when `can_regenerate=True`; otherwise raises `RuntimeError`. |
 
 ---
 

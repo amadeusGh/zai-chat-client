@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar
 
 if TYPE_CHECKING:
     from .client import ZaiClient
-    from .chat_message import ChatMessage
+    from .chat_message import ChatHistoryEntry, ChatMessage
 
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
 
@@ -38,6 +38,7 @@ class ChatSession:
     client: "ZaiClient"
     url: str
     chat_id: str | None = None
+    messages: list["ChatHistoryEntry"] = field(default_factory=list)
     last_action_at: datetime | None = None
     last_action_name: str | None = None
     last_action_monotonic: float | None = None
@@ -86,6 +87,12 @@ class ChatSession:
             deep_think=deep_think,
             web_search=web_search,
         )
+
+    @_chat_action(pace=False)
+    async def refresh_messages(self) -> list["ChatHistoryEntry"]:
+        """Refresh chat history entries from current DOM state and return them."""
+        await self.client._ensure_chat_open(self)
+        return await self.client._refresh_chat_history(self)
 
     @_chat_action(pace=True)
     async def delete(self) -> bool:

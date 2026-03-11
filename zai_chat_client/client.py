@@ -18,7 +18,7 @@ from playwright.async_api import (
 )
 
 from .chat_session import ChatSession
-from .chat_message import ChatMessage
+from .chat_message import ChatHistoryEntry, ChatMessage
 from .core.chat_urls import extract_chat_id, normalize_chat_url
 from .core.cookies import load_storage_state_from_netscape
 from .core.logger import ColorLogger
@@ -43,13 +43,22 @@ class ZaiClient:
     _DEFAULT_WINDOW_WIDTH = 1920
     _DEFAULT_WINDOW_HEIGHT = 1080
     _GEN_POLL_SECONDS = 0.6
-    _GEN_STALL_SECONDS = 22.0
+    _GEN_STALL_SECONDS = 30.0
+    _GEN_STARTUP_STALL_SECONDS = 70.0
     _GEN_TOTAL_TIMEOUT_SECONDS = 1800.0
     _GEN_MAX_REFRESHES = 2
     _GEN_HEARTBEAT_SECONDS = 10.0
     _GEN_WEB_SEARCH_STALE_SECONDS = 35.0
     _GEN_DONE_STABLE_SECONDS = 3.0
     _GEN_DONE_STABLE_REASONING_SECONDS = 8.0
+    _GEN_STOP_STALE_SECONDS = 25.0
+    _GEN_STALL_WITH_STOP_SECONDS = 30.0
+    _SEND_IDLE_TIMEOUT_SECONDS = 240.0
+    _GEN_EMPTY_RESPONSE_SECONDS = 90.0
+    _GEN_EMPTY_RESPONSE_AFTER_REFRESH_SECONDS = 120.0
+    _GEN_EMPTY_RESPONSE_STALLED_SECONDS = 24.0
+    _GEN_EMPTY_RESPONSE_IDLE_AFTER_BUSY_SECONDS = 18.0
+    _SEND_BUTTON_TIMEOUT_MS = 90_000
 
     def __init__(
         self,
@@ -806,6 +815,7 @@ class ZaiClient:
             url=self.page.url,
             chat_id=extract_chat_id(self.page.url),
         )
+        await self._refresh_chat_history(chat)
         self._log.ok(f"New chat ready: {chat.url}")
         return chat
 
@@ -853,6 +863,7 @@ class ZaiClient:
                 f"Failed to open target chat '{target_id}'. Current URL: {self.page.url}"
             )
         chat = ChatSession(client=self, url=self.page.url, chat_id=chat_id)
+        await self._refresh_chat_history(chat)
         self._log.ok(f"Chat opened: {chat.chat_id}")
         return chat
 
@@ -900,6 +911,9 @@ class ZaiClient:
         await self._dismiss_startup_popup_silent(chat=chat)
         if not text.strip():
             raise ValueError("Message text must not be empty.")
+        await self._wait_until_chat_idle(
+            timeout_ms=int(self._SEND_IDLE_TIMEOUT_SECONDS * 1000)
+        )
 
         message = ChatMessage(
             client=self,
@@ -924,11 +938,6 @@ class ZaiClient:
         await self._wait_clickable(input_box, "Chat input")
 
         response_count_before = await self._response_containers().count()
-        send_button = self.page.locator(S.SEND_MESSAGE_BUTTON).first
-        if await send_button.count() == 0:
-            raise MessageSendBlockedError(
-                "Cannot send message now: send button is unavailable."
-            )
         await input_box.click()
         tag_name = (await input_box.evaluate("el => el.tagName")).lower()
         if tag_name == "textarea":
@@ -937,7 +946,8 @@ class ZaiClient:
             await input_box.fill("")
             await input_box.type(text)
         await self._short_pause(120)
-        await self._wait_send_button_ready(send_button, timeout_ms=8_000)
+        send_button = await self._resolve_send_button(timeout_ms=self._SEND_BUTTON_TIMEOUT_MS)
+        await self._wait_send_button_ready(send_button, timeout_ms=self._SEND_BUTTON_TIMEOUT_MS)
 
         previous_url = self.page.url
         started_monotonic = time.monotonic()
@@ -982,6 +992,7 @@ class ZaiClient:
                 f"Response completed with warning: {message.error} "
                 f"(chars={message.response_chars}, refreshes={message.refreshed_count})"
             )
+        await self._refresh_chat_history(chat, tracked_message=message)
         return message
 
     async def _resolve_input_box(self) -> Locator | None:
@@ -1052,9 +1063,9 @@ class ZaiClient:
                 if count > 0:
                     latest = containers.nth(count - 1)
                     if previous_count is not None and count <= previous_count:
-                        if await self._is_response_busy(latest):
+                        if await self._is_response_busy(latest) or await self._is_generation_stop_active():
                             self._log.warn(
-                                "No new response container detected, but latest is generating. "
+                                "No new response container detected, but generation is still active. "
                                 "Using latest block."
                             )
                             return latest
@@ -1137,6 +1148,54 @@ class ZaiClient:
             return True
         return False
 
+    async def _is_latest_response_busy(self) -> bool:
+        """Check busy state on the latest assistant response container."""
+        containers = self._response_containers()
+        count = await containers.count()
+        if count == 0:
+            return False
+        latest = containers.nth(count - 1)
+        return await self._is_response_busy(latest)
+
+    async def _is_generation_stop_active(self) -> bool:
+        """Detect active stop-generation control in the composer area."""
+        stop_button = await self._first_visible(
+            self.page.locator(S.STOP_GENERATION_BUTTON)
+        )
+        if stop_button is not None:
+            return True
+
+        # Fallback heuristic: if send button disappears while latest response is busy,
+        # the UI is typically in active generation state.
+        send_button = self.page.locator(S.SEND_MESSAGE_BUTTON).first
+        send_visible = await send_button.count() > 0 and await send_button.is_visible()
+        if send_visible:
+            return False
+        return await self._is_latest_response_busy()
+
+    async def _wait_until_chat_idle(self, timeout_ms: int) -> None:
+        """Wait until previous response processing is fully finished before sending."""
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        last_log = 0.0
+        while True:
+            await self._dismiss_startup_popup_silent()
+            stop_active = await self._is_generation_stop_active()
+            latest_busy = await self._is_latest_response_busy()
+            if not stop_active and not latest_busy:
+                return
+
+            now = asyncio.get_running_loop().time()
+            if now >= deadline:
+                raise MessageSendBlockedError(
+                    "Previous response is still in progress. Wait for completion and retry."
+                )
+            if now - last_log >= 10.0:
+                last_log = now
+                self._log.info(
+                    "Waiting for previous response to finish before sending next message..."
+                )
+            await asyncio.sleep(0.35)
+
     async def _collect_response_until_done(
         self,
         chat: ChatSession,
@@ -1183,8 +1242,9 @@ class ZaiClient:
             generating = await self._is_response_generating(container)
             thinking_active = await self._is_thinking_active(container)
             web_search_active = await self._is_web_search_active(container)
+            stop_active = await self._is_generation_stop_active()
             now = time.monotonic()
-            if generating or thinking_active or web_search_active:
+            if generating or thinking_active or web_search_active or stop_active:
                 seen_busy_signal = True
                 last_busy_signal_at = now
                 done_candidate_at = None
@@ -1232,13 +1292,25 @@ class ZaiClient:
                 )
                 web_search_active = False
 
+            if (
+                stop_active
+                and not generating
+                and not thinking_active
+                and not web_search_active
+                and message.response_chars > 0
+                and stalled_for > self._GEN_STOP_STALE_SECONDS
+            ):
+                # UI may leave "stop" visible after completion; don't block finalization forever.
+                self._log.warn("Stop button looks stale. Ignoring it for completion checks.")
+                stop_active = False
+
             if elapsed - (last_heartbeat - start) >= self._GEN_HEARTBEAT_SECONDS:
                 last_heartbeat = time.monotonic()
                 self._log.info(
                     "Waiting response... "
                     f"elapsed={int(elapsed)}s, chars={message.response_chars}, "
                     f"generating={generating}, thinking={thinking_active}, "
-                    f"web_search={web_search_active}, "
+                    f"web_search={web_search_active}, stop={stop_active}, "
                     f"refreshes={message.refreshed_count}"
                 )
 
@@ -1246,6 +1318,7 @@ class ZaiClient:
                 not generating
                 and not thinking_active
                 and not web_search_active
+                and not stop_active
                 and message.response_chars > 0
             ):
                 # Require a stability window to avoid premature completion on delayed updates.
@@ -1269,6 +1342,7 @@ class ZaiClient:
                 verify_generating = await self._is_response_generating(container)
                 verify_thinking = await self._is_thinking_active(container)
                 verify_web_search = await self._is_web_search_active(container)
+                verify_stop = await self._is_generation_stop_active()
                 if verify_text != last_text:
                     last_text = verify_text
                     message.response_text = verify_text
@@ -1276,7 +1350,7 @@ class ZaiClient:
                     last_change = time.monotonic()
                     done_candidate_at = None
                     continue
-                if verify_generating or verify_thinking or verify_web_search:
+                if verify_generating or verify_thinking or verify_web_search or verify_stop:
                     done_candidate_at = None
                     continue
                 break
@@ -1284,13 +1358,19 @@ class ZaiClient:
                 not generating
                 and not thinking_active
                 and not web_search_active
+                and not stop_active
                 and message.response_chars == 0
                 and seen_busy_signal
-                and elapsed > 20.0
-                and stalled_for > 14.0
-                and idle_after_busy > 8.0
+                and elapsed
+                > (
+                    self._GEN_EMPTY_RESPONSE_AFTER_REFRESH_SECONDS
+                    if message.refreshed_count > 0
+                    else self._GEN_EMPTY_RESPONSE_SECONDS
+                )
+                and stalled_for > self._GEN_EMPTY_RESPONSE_STALLED_SECONDS
+                and idle_after_busy > self._GEN_EMPTY_RESPONSE_IDLE_AFTER_BUSY_SECONDS
             ):
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.5)
                 retry_text = await self._extract_response_text(container)
                 if retry_text != last_text:
                     last_text = retry_text
@@ -1305,11 +1385,40 @@ class ZaiClient:
                 retry_generating = await self._is_response_generating(container)
                 retry_thinking = await self._is_thinking_active(container)
                 retry_web_search = await self._is_web_search_active(container)
-                if retry_generating or retry_thinking or retry_web_search:
+                retry_stop = await self._is_generation_stop_active()
+                if retry_generating or retry_thinking or retry_web_search or retry_stop:
                     self._log.info(
                         "Empty-response check recovered: response activity resumed."
                     )
                     continue
+                if message.refreshed_count > 0 or saw_reasoning_signal:
+                    try:
+                        container = await self._recover_response_container(
+                            prefix=(message.response_text or "")[:80]
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(3.0)
+                    retry_text = await self._extract_response_text(container)
+                    if retry_text != last_text:
+                        last_text = retry_text
+                        message.response_text = retry_text
+                        message.response_chars = len(retry_text)
+                        last_change = time.monotonic()
+                        if message.response_chars > 0:
+                            self._log.info(
+                                "Empty-response check recovered after rebind: text appeared."
+                            )
+                        continue
+                    retry_generating = await self._is_response_generating(container)
+                    retry_thinking = await self._is_thinking_active(container)
+                    retry_web_search = await self._is_web_search_active(container)
+                    retry_stop = await self._is_generation_stop_active()
+                    if retry_generating or retry_thinking or retry_web_search or retry_stop:
+                        self._log.info(
+                            "Empty-response check recovered after rebind: response activity resumed."
+                        )
+                        continue
                 message.error = "Assistant returned an empty response."
                 break
             else:
@@ -1319,11 +1428,19 @@ class ZaiClient:
                 message.error = "Generation timeout exceeded."
                 break
 
+            stall_limit = (
+                self._GEN_STARTUP_STALL_SECONDS
+                if message.response_chars == 0
+                else self._GEN_STALL_SECONDS
+            )
+            if stop_active and message.response_chars > 0:
+                stall_limit = max(stall_limit, self._GEN_STALL_WITH_STOP_SECONDS)
+
             if (
                 not thinking_active
                 and not web_search_active
-                and stalled_for > self._GEN_STALL_SECONDS
-                and (generating or message.response_chars == 0)
+                and stalled_for > stall_limit
+                and (generating or stop_active or message.response_chars == 0)
             ):
                 if message.refreshed_count >= self._GEN_MAX_REFRESHES:
                     message.error = (
@@ -1476,28 +1593,151 @@ class ZaiClient:
             return None
         return await wrappers.nth(count - 1).get_attribute("id")
 
+    async def _refresh_chat_history(
+        self,
+        chat: ChatSession,
+        tracked_message: ChatMessage | None = None,
+    ) -> list[ChatHistoryEntry]:
+        """Rebuild chat history entries from DOM wrappers in display order."""
+        wrappers = self.page.locator(S.MESSAGE_WRAPPER)
+        count = await wrappers.count()
+        history: list[ChatHistoryEntry] = []
+        for i in range(count):
+            wrapper = wrappers.nth(i)
+            dom_id = await wrapper.get_attribute("id")
+            role = await self._resolve_message_role(wrapper)
+            if role is None:
+                continue
+            if role == "user":
+                text = await self._extract_user_message_text(wrapper)
+            else:
+                container = wrapper.locator("#response-content-container").last
+                if await container.count() > 0:
+                    text = await self._extract_response_text(container)
+                else:
+                    assistant = wrapper.locator(".chat-assistant").first
+                    text = await self._safe_locator_inner_text(assistant, timeout_ms=800)
+            text = self._normalize_history_text(text)
+            if not text and role == "user":
+                continue
+
+            entry = ChatHistoryEntry(
+                client=self,
+                chat=chat,
+                role=role,
+                text=text,
+                dom_id=dom_id,
+                response_chars=len(text),
+            )
+            if (
+                tracked_message is not None
+                and role == "assistant"
+                and tracked_message.assistant_message_dom_id == dom_id
+            ):
+                entry.generation_started_at = tracked_message.generation_started_at
+                entry.generation_finished_at = tracked_message.generation_finished_at
+                entry.generation_seconds = tracked_message.generation_seconds
+                entry.error = tracked_message.error
+                entry.source_message = tracked_message
+            history.append(entry)
+
+        if tracked_message is not None and tracked_message.assistant_message_dom_id is None:
+            for entry in reversed(history):
+                if entry.role != "assistant":
+                    continue
+                entry.generation_started_at = tracked_message.generation_started_at
+                entry.generation_finished_at = tracked_message.generation_finished_at
+                entry.generation_seconds = tracked_message.generation_seconds
+                entry.error = tracked_message.error
+                entry.source_message = tracked_message
+                break
+
+        chat.messages = history
+        return history
+
+    async def _resolve_message_role(self, wrapper: Locator) -> str | None:
+        """Classify wrapper role as `user` or `assistant`."""
+        user_block = wrapper.locator(".chat-user").first
+        if await user_block.count() > 0:
+            return "user"
+        assistant_block = wrapper.locator(".chat-assistant").first
+        if await assistant_block.count() > 0:
+            return "assistant"
+        return None
+
+    async def _extract_user_message_text(self, wrapper: Locator) -> str:
+        """Extract user bubble text while excluding controls like Edit/Copy."""
+        user_block = wrapper.locator(".chat-user").first
+        if await user_block.count() == 0:
+            return ""
+        try:
+            text = await user_block.evaluate(
+                """(el) => {
+                    const bubble = el.querySelector('.whitespace-pre-wrap');
+                    const source = bubble || el;
+                    return (source.innerText || '').trim();
+                }"""
+            )
+        except Exception:
+            text = await self._safe_locator_inner_text(user_block, timeout_ms=800)
+        return text or ""
+
+    def _normalize_history_text(self, text: str) -> str:
+        """Normalize extracted message text for clean history representation."""
+        cleaned = re.sub(r"[ \t]+\n", "\n", text or "")
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
     async def _wait_send_button_ready(
         self,
         send_button: Locator,
-        timeout_ms: int = 8_000,
+        timeout_ms: int = _SEND_BUTTON_TIMEOUT_MS,
     ) -> None:
         """Wait until send button becomes enabled and not marked disabled."""
-        await send_button.wait_for(state="visible", timeout=timeout_ms)
         deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
         while True:
-            disabled_attr = await send_button.get_attribute("disabled")
-            class_attr = (await send_button.get_attribute("class") or "").lower()
-            if (
-                await send_button.is_enabled()
-                and disabled_attr is None
-                and "disabled" not in class_attr
-            ):
-                return
+            if await send_button.count() == 0:
+                send_button = await self._resolve_send_button(
+                    timeout_ms=max(500, int((deadline - asyncio.get_running_loop().time()) * 1000))
+                )
+            try:
+                await send_button.wait_for(state="visible", timeout=min(1_000, timeout_ms))
+                disabled_attr = await send_button.get_attribute("disabled")
+                class_attr = (await send_button.get_attribute("class") or "").lower()
+                if (
+                    await send_button.is_enabled()
+                    and disabled_attr is None
+                    and "disabled" not in class_attr
+                ):
+                    return
+            except Exception:
+                pass
             if asyncio.get_running_loop().time() >= deadline:
                 raise MessageSendBlockedError(
                     "Cannot send message: send button did not become ready."
                 )
             await asyncio.sleep(0.1)
+
+    async def _resolve_send_button(self, timeout_ms: int = _SEND_BUTTON_TIMEOUT_MS) -> Locator:
+        """Resolve a visible send button with retries after composer rerenders/reloads."""
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        last_seen = False
+        while True:
+            await self._dismiss_startup_popup_silent()
+            send_button = self.page.locator(S.SEND_MESSAGE_BUTTON).first
+            try:
+                if await send_button.count() > 0:
+                    last_seen = True
+                    if await send_button.is_visible():
+                        return send_button
+            except Exception:
+                pass
+            if asyncio.get_running_loop().time() >= deadline:
+                suffix = " after button rerender" if last_seen else ""
+                raise MessageSendBlockedError(
+                    f"Cannot send message now: send button is unavailable{suffix}."
+                )
+            await asyncio.sleep(0.12)
 
     async def _regenerate_message(self, message: ChatMessage) -> ChatMessage:
         """Trigger regeneration and collect the refreshed assistant response."""
@@ -1543,6 +1783,7 @@ class ZaiClient:
             )
         else:
             self._log.warn(f"Regeneration finished with warning: {regenerated.error}")
+        await self._refresh_chat_history(message.chat, tracked_message=regenerated)
         return regenerated
 
     async def _resolve_regenerate_button(self, message: ChatMessage) -> Locator:

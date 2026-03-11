@@ -19,6 +19,11 @@ CHAT_INPUT_CANDIDATES = (
 
 SEND_MESSAGE_BUTTON = "#send-message-button"
 RESPONSE_CONTAINER = ".chat-assistant #response-content-container"
+STOP_GENERATION_BUTTON = (
+    "form button:has(span.block.size-3), "
+    "form button:has(span.block.rounded-xs.size-3), "
+    "form button:has(span.block.rounded-sm.size-3)"
+)
 
 CHAT_MODE_TAB = "button[role='tab'][data-value='chat']"
 MODEL_SELECTOR_BUTTON = "button[aria-label='Select a model']"
@@ -30,6 +35,8 @@ DEEP_THINK_BUTTON = "button[data-autothink]"
 WEB_SEARCH_SVG_PATH_PREFIX = "svg path[d^='M0.665039 7.33166H13.9984']"
 
 ASSISTANT_WRAPPER = "div[id^='message-']"
+USER_WRAPPER = "div.user-message[id^='message-']"
+MESSAGE_WRAPPER = "div[id^='message-']"
 REGENERATE_BUTTON = "button.regenerate-response-button"
 
 CHAT_MENU_BUTTON = "button[aria-label='Chat Menu']"
@@ -38,4 +45,3 @@ SIDEBAR_TOGGLE_BUTTON = "#sidebar-toggle-button"
 THINKING_CONTAINER = ".thinking-chain-container"
 THINKING_SHIMMER = "span.shimmer"
 GEN_DOT = ".dot"
-

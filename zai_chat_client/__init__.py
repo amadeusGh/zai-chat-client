@@ -1,7 +1,7 @@
 """Public package exports for zai_chat_client."""
 
 from .chat_session import ChatSession
-from .chat_message import ChatMessage
+from .chat_message import ChatHistoryEntry, ChatMessage
 from .client import ZaiClient
 from .core.logger import ColorLogger
 from .exceptions import (
@@ -20,6 +20,7 @@ __all__ = [
     "ZaiClient",
     "ChatSession",
     "ChatMessage",
+    "ChatHistoryEntry",
     "ColorLogger",
     "ZaiClientError",
     "CookieFileError",
