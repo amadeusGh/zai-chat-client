@@ -59,12 +59,16 @@ class ZaiClient:
     _GEN_EMPTY_RESPONSE_STALLED_SECONDS = 24.0
     _GEN_EMPTY_RESPONSE_IDLE_AFTER_BUSY_SECONDS = 18.0
     _SEND_BUTTON_TIMEOUT_MS = 90_000
+    _INPUT_FILL_TIMEOUT_MS = 90_000
+    _INPUT_FILL_RETRIES = 3
+    _INPUT_JS_CHUNK_THRESHOLD = 20_000
+    _INPUT_JS_CHUNK_SIZE = 8_000
 
     def __init__(
         self,
         base_url: str = "https://chat.z.ai",
         headless: bool = True,
-        use_camoufox: bool = True,
+        use_camoufox: bool = False,
         window_width: int | None = None,
         window_height: int | None = None,
         session: str | Path | None = None,
@@ -938,13 +942,7 @@ class ZaiClient:
         await self._wait_clickable(input_box, "Chat input")
 
         response_count_before = await self._response_containers().count()
-        await input_box.click()
-        tag_name = (await input_box.evaluate("el => el.tagName")).lower()
-        if tag_name == "textarea":
-            await input_box.fill(text)
-        else:
-            await input_box.fill("")
-            await input_box.type(text)
+        await self._set_input_text(text)
         await self._short_pause(120)
         send_button = await self._resolve_send_button(timeout_ms=self._SEND_BUTTON_TIMEOUT_MS)
         await self._wait_send_button_ready(send_button, timeout_ms=self._SEND_BUTTON_TIMEOUT_MS)
@@ -1008,6 +1006,154 @@ class ZaiClient:
             if await box.count() > 0 and await box.is_visible():
                 return box
         return None
+
+    async def _set_input_text(self, text: str) -> None:
+        """Insert prompt text into composer with retries and JS fallback."""
+        if len(text) > self._INPUT_JS_CHUNK_THRESHOLD:
+            self._log.info(
+                f"Large prompt detected ({len(text)} chars). Using chunked JS insert."
+            )
+            await self._set_input_text_chunked_js(text)
+            return
+
+        last_error: Exception | None = None
+        for attempt in range(1, self._INPUT_FILL_RETRIES + 1):
+            await self._dismiss_startup_popup_silent()
+            input_box = await self._resolve_input_box()
+            if input_box is None:
+                last_error = MessageSendBlockedError("Message input element not found.")
+                await asyncio.sleep(0.25)
+                continue
+            try:
+                await self._wait_clickable(input_box, "Chat input")
+                await input_box.click()
+                tag_name = (await input_box.evaluate("el => el.tagName")).lower()
+                if tag_name == "textarea":
+                    await input_box.fill(text, timeout=self._INPUT_FILL_TIMEOUT_MS)
+                else:
+                    await input_box.fill("", timeout=self._INPUT_FILL_TIMEOUT_MS)
+                    await input_box.type(text, timeout=self._INPUT_FILL_TIMEOUT_MS)
+                return
+            except Exception as error:
+                last_error = error
+                self._log.warn(
+                    f"Input fill attempt {attempt}/{self._INPUT_FILL_RETRIES} failed: "
+                    f"{error.__class__.__name__}"
+                )
+                # Fallback: set value/content directly and fire input events.
+                try:
+                    await input_box.evaluate(
+                        """(el, value) => {
+                            const tag = (el.tagName || '').toLowerCase();
+                            if (tag === 'textarea' || tag === 'input') {
+                                el.value = value;
+                            } else if (el.isContentEditable) {
+                                el.textContent = value;
+                            } else {
+                                el.value = value;
+                            }
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""",
+                        text,
+                        timeout=min(self._INPUT_FILL_TIMEOUT_MS, 15_000),
+                    )
+                    return
+                except Exception as js_error:
+                    last_error = js_error
+                await asyncio.sleep(0.35)
+        if last_error is not None:
+            raise last_error
+        raise MessageSendBlockedError("Could not set prompt text into chat input.")
+
+    async def _set_input_text_chunked_js(self, text: str) -> None:
+        """Insert large prompt text in chunks to avoid UI freezes on fill()."""
+        chunks = [
+            text[i:i + self._INPUT_JS_CHUNK_SIZE]
+            for i in range(0, len(text), self._INPUT_JS_CHUNK_SIZE)
+        ]
+        last_error: Exception | None = None
+        for attempt in range(1, self._INPUT_FILL_RETRIES + 1):
+            await self._dismiss_startup_popup_silent()
+            input_box = await self._resolve_input_box()
+            if input_box is None:
+                last_error = MessageSendBlockedError("Message input element not found.")
+                await asyncio.sleep(0.25)
+                continue
+            try:
+                await self._wait_clickable(input_box, "Chat input")
+                await input_box.click()
+                await input_box.evaluate(
+                    """(el) => {
+                        const tag = (el.tagName || '').toLowerCase();
+                        if (tag === 'textarea' || tag === 'input') {
+                            el.value = '';
+                        } else if (el.isContentEditable) {
+                            el.textContent = '';
+                        } else {
+                            el.value = '';
+                        }
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }""",
+                    timeout=10_000,
+                )
+                total_chunks = len(chunks)
+                progress_step = max(1, total_chunks // 8)
+                for idx, chunk in enumerate(chunks, start=1):
+                    await input_box.evaluate(
+                        """(el, valueChunk) => {
+                            const tag = (el.tagName || '').toLowerCase();
+                            if (tag === 'textarea' || tag === 'input') {
+                                el.value = (el.value || '') + valueChunk;
+                            } else if (el.isContentEditable) {
+                                el.textContent = (el.textContent || '') + valueChunk;
+                            } else {
+                                el.value = (el.value || '') + valueChunk;
+                            }
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                        }""",
+                        chunk,
+                        timeout=min(self._INPUT_FILL_TIMEOUT_MS, 15_000),
+                    )
+                    if idx == total_chunks or idx % progress_step == 0:
+                        self._log.info(
+                            f"Chunked input progress: {idx}/{total_chunks}"
+                        )
+                    await asyncio.sleep(0.02)
+                await input_box.evaluate(
+                    """(el) => {
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""",
+                    timeout=8_000,
+                )
+                inserted_len = await input_box.evaluate(
+                    """(el) => {
+                        const tag = (el.tagName || '').toLowerCase();
+                        if (tag === 'textarea' || tag === 'input') {
+                            return (el.value || '').length;
+                        }
+                        if (el.isContentEditable) {
+                            return (el.textContent || '').length;
+                        }
+                        return ((el.value || el.textContent || '') + '').length;
+                    }""",
+                    timeout=8_000,
+                )
+                if isinstance(inserted_len, int) and inserted_len >= len(text):
+                    return
+                raise MessageSendBlockedError(
+                    f"Chunked insert length mismatch ({inserted_len}/{len(text)})."
+                )
+            except Exception as error:
+                last_error = error
+                self._log.warn(
+                    f"Chunked input attempt {attempt}/{self._INPUT_FILL_RETRIES} failed: "
+                    f"{error.__class__.__name__}"
+                )
+                await asyncio.sleep(0.35)
+        if last_error is not None:
+            raise last_error
+        raise MessageSendBlockedError("Could not set large prompt text into chat input.")
 
     async def _wait_composer_ready(self, timeout_ms: int) -> None:
         """Wait until chat composer controls are available for interaction."""

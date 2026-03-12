@@ -40,16 +40,17 @@ python -m playwright install
 
 ## Camoufox (anti-bot friendly mode)
 
-By default, this library uses Camoufox: [https://github.com/daijro/camoufox](https://github.com/daijro/camoufox)
+By default, this library runs on pure Playwright (`use_camoufox=False`).
+Camoufox is optional: [https://github.com/daijro/camoufox](https://github.com/daijro/camoufox)
 
-Camoufox tweaks browser fingerprints and reduces common automation signals. In practice, this helps when a website behaves differently under default Playwright automation or applies anti-bot checks. If you prefer pure Playwright behavior, disable it like this:
+Camoufox tweaks browser fingerprints and reduces common automation signals. In practice, this helps when a website behaves differently under default Playwright automation or applies anti-bot checks. To enable Camoufox explicitly:
 
 ```python
 from zai_chat_client import ZaiClient
 
 client = ZaiClient(
     session="main",
-    use_camoufox=False,
+    use_camoufox=True,
 )
 ```
 
@@ -272,7 +273,7 @@ client = ZaiClient(...)
 | ---------------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `base_url`                         | `str`               | Base URL of the chat service. Default: `https://chat.z.ai`. Normally you don't need to change it.                  |
 | `headless`                         | `bool`              | Whether the browser runs without a visible window. Set `False` if you want to see the browser or use manual login. |
-| `use_camoufox`                     | `bool`              | Enables Camoufox browser fingerprint modifications to reduce automation detection. Enabled by default.              |
+| `use_camoufox`                     | `bool`              | Enables Camoufox browser fingerprint modifications to reduce automation detection. Disabled by default (set `True` to enable). |
 | `window_width`                     | `int \| None`       | Optional browser window width. Useful when running non-headless sessions.                                           |
 | `window_height`                    | `int \| None`       | Optional browser window height.                                                                                      |
 | `session`                          | `str \| Path \| None` | Name or path for the stored browser session. If valid, the client restores login automatically.                   |

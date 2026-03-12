@@ -8,7 +8,7 @@ class ZaiClientConfig:
 
     base_url: str
     headless: bool = True
-    use_camoufox: bool = True
+    use_camoufox: bool = False
     window_width: int | None = None
     window_height: int | None = None
     session: str | Path | None = None
