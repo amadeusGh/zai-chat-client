@@ -52,6 +52,7 @@ class ZaiClient:
     _GEN_DONE_STABLE_SECONDS = 3.0
     _GEN_DONE_STABLE_REASONING_SECONDS = 8.0
     _GEN_STOP_STALE_SECONDS = 25.0
+    _GEN_REASONING_STALL_SECONDS = 60.0
     _GEN_STALL_WITH_STOP_SECONDS = 30.0
     _SEND_IDLE_TIMEOUT_SECONDS = 240.0
     _GEN_EMPTY_RESPONSE_SECONDS = 90.0
@@ -1362,6 +1363,7 @@ class ZaiClient:
         last_busy_signal_at = start
         done_candidate_at: float | None = None
         saw_reasoning_signal = False
+        reasoning_started_at: float | None = None
 
         while True:
             # Popups can interrupt page context mid-generation; recover container if needed.
@@ -1422,6 +1424,31 @@ class ZaiClient:
             if web_search_text and web_search_text != last_web_search_text:
                 last_web_search_text = web_search_text
                 self._log.info(f"Web search: {web_search_text}")
+
+            # Thinking/search phase can occasionally hang forever without
+            # transitioning to token generation. Recover by refreshing.
+            if thinking_active or web_search_active:
+                if reasoning_started_at is None:
+                    reasoning_started_at = now
+                elif (now - reasoning_started_at) > self._GEN_REASONING_STALL_SECONDS:
+                    if message.refreshed_count >= self._GEN_MAX_REFRESHES:
+                        message.error = (
+                            "Reasoning phase stalled; max recovery attempts exceeded."
+                        )
+                        break
+                    message.refreshed_count += 1
+                    prefix = (message.response_text or "")[:80]
+                    self._log.warn(
+                        "Thinking/search stalled too long. "
+                        f"Refreshing page (attempt {message.refreshed_count}/{self._GEN_MAX_REFRESHES})"
+                    )
+                    await self._reload_chat_page()
+                    await self._ensure_chat_open(chat)
+                    container = await self._recover_response_container(prefix=prefix)
+                    last_change = time.monotonic()
+                    reasoning_started_at = time.monotonic()
+            else:
+                reasoning_started_at = None
 
             elapsed = now - start
             stalled_for = now - last_change
